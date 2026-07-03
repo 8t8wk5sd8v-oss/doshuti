@@ -17,7 +17,6 @@ let state = {
 let pollInterval = null;
 let timerInterval = null;
 
-// ---- Firebase helpers ----
 async function fbGet(path) {
   const res = await fetch(FIREBASE_URL + path + '.json');
   return res.ok ? res.json() : null;
@@ -38,7 +37,6 @@ async function fbDelete(path) {
   await fetch(FIREBASE_URL + path + '.json', { method: 'DELETE' });
 }
 
-// ---- UI helpers ----
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
@@ -89,17 +87,13 @@ window.addEventListener('load', () => {
   if (hint) hint.textContent = 'Игроки открывают: ' + url;
 });
 
-// ---- BACK ----
 async function goBack(from) {
   clearInterval(pollInterval); clearInterval(timerInterval);
-  if (from === 'screen-host-lobby' && state.roomCode) {
-    await fbDelete('/rooms/' + state.roomCode);
-  }
+  if (from === 'screen-host-lobby' && state.roomCode) await fbDelete('/rooms/' + state.roomCode);
   if (from === 'screen-player-lobby' && state.roomCode && state.playerName) {
     const room = await fbGet('/rooms/' + state.roomCode);
     if (room && room.players) {
-      const players = room.players.filter(p => p !== state.playerName);
-      await fbUpdate('/rooms/' + state.roomCode, { players });
+      await fbUpdate('/rooms/' + state.roomCode, { players: room.players.filter(p => p !== state.playerName) });
     }
   }
   resetState();
@@ -171,26 +165,29 @@ async function startGame() {
     roundTime: parseInt(document.getElementById('time-slider').value),
   });
   clearInterval(pollInterval);
-  beginRound();
+  await beginRound();
 }
 
 async function beginRound() {
   const room = await fbGet('/rooms/' + state.roomCode);
   const round = (room.currentRound || 0) + 1;
   const joke = pickJoke(room.jokesUsed);
-  await fbSet('/rooms/' + state.roomCode + '/answers', {});
-  await fbSet('/rooms/' + state.roomCode + '/votes', {});
+  // сначала сбрасываем ответы и голоса, потом меняем фазу
+  await fbSet('/rooms/' + state.roomCode + '/answers', null);
+  await fbSet('/rooms/' + state.roomCode + '/votes', null);
   await fbUpdate('/rooms/' + state.roomCode, {
-    currentRound: round, joke,
+    currentRound: round,
+    joke,
     jokesUsed: [...(room.jokesUsed||[]), joke],
     phase: 'answering',
   });
-  document.getElementById('round-badge').textContent = 'Раунд ' + round + ' / ' + room.totalRounds;
+  const updated = await fbGet('/rooms/' + state.roomCode);
+  document.getElementById('round-badge').textContent = 'Раунд ' + round + ' / ' + updated.totalRounds;
   document.getElementById('host-joke-setup').textContent = joke;
   showScreen('screen-host-round');
-  renderAnswersStatus([], room.players||[]);
-  startHostTimer(room.roundTime, () => hostEndAnswering());
-  startHostAnswerPoll(room.players||[], room.totalRounds, room.roundTime);
+  renderAnswersStatus([], updated.players||[]);
+  startHostTimer(updated.roundTime, () => hostEndAnswering());
+  startHostAnswerPoll(updated.players||[]);
 }
 
 function startHostTimer(secs, onEnd) {
@@ -208,14 +205,16 @@ function startHostTimer(secs, onEnd) {
   }, 1000);
 }
 
-function startHostAnswerPoll(players, totalRounds, roundTime) {
+function startHostAnswerPoll(players) {
   clearInterval(pollInterval);
   pollInterval = setInterval(async () => {
     const room = await fbGet('/rooms/' + state.roomCode); if (!room) return;
     const answers = room.answers || {};
-    renderAnswersStatus(Object.keys(answers), players);
-    if (Object.keys(answers).length >= players.length) {
-      clearInterval(pollInterval); clearInterval(timerInterval); hostEndAnswering();
+    const answeredKeys = Object.keys(answers);
+    renderAnswersStatus(answeredKeys, players);
+    if (answeredKeys.length >= players.length) {
+      clearInterval(pollInterval); clearInterval(timerInterval);
+      await hostEndAnswering();
     }
   }, 1500);
 }
@@ -237,7 +236,8 @@ async function hostEndAnswering() {
 function showHostVoteScreen(room) {
   document.getElementById('vote-host-setup').textContent = room.joke;
   const listEl = document.getElementById('host-answers-list');
-  const answers = room.answers || {}, keys = Object.keys(answers);
+  const answers = room.answers || {};
+  const keys = Object.keys(answers);
   if (!keys.length) {
     listEl.innerHTML = '<p style="color:#9b7cbf; text-align:center; font-style:italic;">Никто не ответил...</p>';
   } else {
@@ -271,16 +271,18 @@ function startHostVotePoll(answerKeys, playerCount) {
 async function hostShowResults() {
   clearInterval(pollInterval);
   const room = await fbGet('/rooms/' + state.roomCode);
-  const votes = room.votes || {}, answers = room.answers || {}, voteCounts = {};
+  const votes = room.votes || {};
+  const answers = room.answers || {};
+  const voteCounts = {};
   Object.values(votes).forEach(p => voteCounts[p] = (voteCounts[p]||0)+1);
   const winner = Object.keys(voteCounts).sort((a,b) => voteCounts[b]-voteCounts[a])[0];
   const scores = room.scores || {};
   if (winner) scores[winner] = (scores[winner]||0) + (voteCounts[winner]||0);
   const isLast = room.currentRound >= room.totalRounds;
-  await fbUpdate('/rooms/' + state.roomCode, { scores, phase: isLast ? 'final' : 'results' });
-  const updated = await fbGet('/rooms/' + state.roomCode);
-  if (isLast) showFinalScreen(updated);
-  else showResultsScreen(updated, votes, answers, winner, voteCounts, 'host');
+  const newPhase = isLast ? 'final' : 'results';
+  await fbUpdate('/rooms/' + state.roomCode, { scores, phase: newPhase });
+  if (isLast) showFinalScreen({ ...room, scores });
+  else showResultsScreen({ ...room, scores }, votes, answers, winner, voteCounts, 'host');
 }
 
 // ---- PLAYER ----
@@ -315,20 +317,48 @@ function renderPlayerLobbyList(players, me) {
   ).join('');
 }
 
+// Запоминаем последнюю фазу чтобы не перерисовывать экран лишний раз
+let lastSeenPhase = null;
+let lastSeenRound = null;
+
 function startPlayerPoll() {
   clearInterval(pollInterval);
+  lastSeenPhase = null;
+  lastSeenRound = null;
   pollInterval = setInterval(async () => {
     const room = await fbGet('/rooms/' + state.roomCode); if (!room) return;
     const cur = getCurrentScreen();
-    if (room.phase === 'lobby') { renderPlayerLobbyList(room.players, state.playerName); }
-    else if (room.phase === 'answering' && cur !== 'screen-player-answer') {
-      state.myAnswerSubmitted = !!(room.answers && room.answers[state.playerName]);
-      showPlayerAnswerScreen(room);
-    } else if (room.phase === 'voting' && cur !== 'screen-player-vote') { showPlayerVoteScreen(room); }
-    else if (room.phase === 'results' && cur !== 'screen-round-results') { showPlayerResultsScreen(room); }
-    else if (room.phase === 'final' && cur !== 'screen-final') { showFinalScreen(room); }
+    const phase = room.phase;
+    const round = room.currentRound;
 
-    if (room.phase === 'answering' && cur === 'screen-player-answer') {
+    if (phase === 'lobby') {
+      renderPlayerLobbyList(room.players, state.playerName);
+      lastSeenPhase = phase;
+      return;
+    }
+
+    // Переход в новый экран только если фаза или раунд изменились
+    const phaseChanged = phase !== lastSeenPhase;
+    const roundChanged = round !== lastSeenRound;
+
+    if (phase === 'answering' && (phaseChanged || roundChanged)) {
+      lastSeenPhase = phase; lastSeenRound = round;
+      state.myAnswerSubmitted = !!(room.answers && room.answers[state.playerName]);
+      state.myVote = null;
+      showPlayerAnswerScreen(room);
+    } else if (phase === 'voting' && phaseChanged) {
+      lastSeenPhase = phase;
+      showPlayerVoteScreen(room);
+    } else if (phase === 'results' && phaseChanged) {
+      lastSeenPhase = phase;
+      showPlayerResultsScreen(room);
+    } else if (phase === 'final' && phaseChanged) {
+      lastSeenPhase = phase;
+      showFinalScreen(room);
+    }
+
+    // Обновляем статус ответа
+    if (phase === 'answering' && cur === 'screen-player-answer') {
       if (room.answers && room.answers[state.playerName] && !state.myAnswerSubmitted) {
         state.myAnswerSubmitted = true;
         document.getElementById('player-answer-input').disabled = true;
@@ -336,7 +366,11 @@ function startPlayerPoll() {
         document.getElementById('answer-status').textContent = '✓ Ответ принят! Ждём остальных...';
       }
     }
-    if (room.phase === 'voting' && cur === 'screen-player-vote') { renderPlayerVoteList(room); }
+
+    // Обновляем список голосования в реальном времени
+    if (phase === 'voting' && cur === 'screen-player-vote') {
+      renderPlayerVoteList(room);
+    }
   }, 1500);
 }
 
@@ -349,8 +383,8 @@ function showPlayerAnswerScreen(room) {
   document.getElementById('char-count').textContent = '0 / 200';
   document.getElementById('player-timer').textContent = room.roundTime;
   showScreen('screen-player-answer');
-  let t = room.roundTime;
   clearInterval(timerInterval);
+  let t = room.roundTime;
   timerInterval = setInterval(() => {
     t--; document.getElementById('player-timer').textContent = t;
     if (t <= 0) clearInterval(timerInterval);
@@ -400,7 +434,6 @@ async function castVote(player) {
   renderPlayerVoteList(room);
 }
 
-// ---- RESULTS ----
 function showResultsScreen(room, votes, answers, winner, voteCounts, role) {
   const keys = Object.keys(answers).sort((a,b) => (voteCounts[b]||0)-(voteCounts[a]||0));
   document.getElementById('results-list').innerHTML = keys.map((player, i) => {
@@ -429,7 +462,6 @@ function showResultsScreen(room, votes, answers, winner, voteCounts, role) {
   document.getElementById('next-round-btn').style.display = role==='host' ? 'block' : 'none';
   document.getElementById('player-wait-btn').style.display = role==='player' ? 'block' : 'none';
   showScreen('screen-round-results');
-  if (role === 'player') startPlayerResultPoll();
 }
 
 function showPlayerResultsScreen(room) {
@@ -439,22 +471,11 @@ function showPlayerResultsScreen(room) {
   showResultsScreen(room, votes, answers, winner, voteCounts, 'player');
 }
 
-function startPlayerResultPoll() {
-  clearInterval(pollInterval);
-  pollInterval = setInterval(async () => {
-    const room = await fbGet('/rooms/' + state.roomCode); if (!room) return;
-    if (room.phase === 'answering') {
-      clearInterval(pollInterval);
-      state.myAnswerSubmitted = false; state.myVote = null;
-      showPlayerAnswerScreen(room);
-    } else if (room.phase === 'final') { clearInterval(pollInterval); showFinalScreen(room); }
-  }, 1500);
-}
-
 async function nextRound() {
   clearInterval(pollInterval);
-  await fbUpdate('/rooms/' + state.roomCode, { phase: 'answering' });
-  beginRound();
+  lastSeenPhase = null;
+  lastSeenRound = null;
+  await beginRound();
 }
 
 function showFinalScreen(room) {
